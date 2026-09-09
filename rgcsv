@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# rgcsv — search a file with ripgrep, but keep the output valid CSV.
+#
+# For CSV/TSV files the header is printed first, then the matching records.
+# Multi-line records (quoted fields containing newlines) are handled: the
+# file is folded into one physical line per logical record before searching,
+# and matching records are printed back in their original multi-line form.
+# That means a match anywhere in a record prints the whole record, so the
+# output can always be piped into a CSV tool:
+#
+#   rgcsv PATTERN sales.csv | vd -f csv -
+#   rgcsv -i widget data.tsv | vd -f tsv -
+#
+# Any ripgrep options can go before the pattern (e.g. -i, -w, -e).
+# For non-CSV files it behaves exactly like plain `rg PATTERN FILE`.
+set -u
+
+if (( $# < 2 )); then
+    echo "usage: rgcsv [rg options] PATTERN FILE" >&2
+    echo "example: rgcsv -i widget sales.csv | vd -f csv -" >&2
+    exit 2
+fi
+
+file="${!#}"              # last argument is the file
+args=("${@:1:$#-1}")      # everything before it: rg options + pattern
+
+if [[ ! -f "$file" ]]; then
+    echo "rgcsv: no such file: $file" >&2
+    exit 2
+fi
+
+# ASCII record separator: stands in for newlines inside quoted fields while
+# rg searches, then gets turned back into newlines on output.
+SEP=$'\x1e'
+
+# Emit one physical line per logical CSV record, with embedded newlines
+# replaced by SEP. A record is complete once its cumulative count of quote
+# characters is even (doubled "" quotes add 2, so they keep parity intact).
+fold_records() {
+    awk -v sep="$SEP" '
+        { q = gsub(/"/, "\"")
+          rec = open ? rec sep $0 : $0
+          open = (open + q) % 2
+          if (!open) { print rec; rec = "" } }
+        END { if (open) print rec }   # unterminated quote: emit what we have
+    ' "$1"
+}
+
+# Print the first logical record (the header) as-is, which may itself span
+# several lines, then stop reading.
+print_header() {
+    awk '
+        { q = gsub(/"/, "\"")
+          print
+          open = (open + q) % 2
+          if (!open) exit }
+    ' "$1"
+}
+
+shopt -s nocasematch
+case "$file" in
+    *.csv|*.tsv)
+        print_header "$file"
+        fold_records "$file" | tail -n +2 | rg "${args[@]}" | tr "$SEP" '\n'
+        exit "${PIPESTATUS[2]}"   # report rg's status: 0 matches, 1 none
+        ;;
+    *)
+        exec rg "${args[@]}" -- "$file"
+        ;;
+esac
